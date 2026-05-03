@@ -2,4 +2,15 @@
 __pycache__/
 *.pt
 *.pyc
-output.jpg
+
+# images
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# videos
+*.mp4
+*.avi
+*.mov
+*.mkv

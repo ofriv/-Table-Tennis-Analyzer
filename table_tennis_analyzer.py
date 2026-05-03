@@ -2,49 +2,46 @@ import sys
 import cv2
 from ultralytics import YOLO
 
+START_FRAME = 0
+END_FRAME = 200
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python table_tennis_analyzer.py <image_path>")
+        print("Usage: python table_tennis_analyzer.py <video_path>")
         sys.exit(1)
 
-    image_path = sys.argv[1]
     model = YOLO("yolov8n-pose.pt")
-    results = model(image_path)
 
-    img = cv2.imread(image_path)
+    cap = cv2.VideoCapture(sys.argv[1])
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps    = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    for result in results:
-        boxes = result.boxes
-        keypoints = result.keypoints
+    end = total_frames if END_FRAME == 0 else END_FRAME
 
-        # Draw bounding boxes
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    out = cv2.VideoWriter(
+        "output_with_detections.mp4",
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height)
+    )
 
-        # Draw pose keypoints and skeleton
-        if keypoints is not None:
-            for person_kps in keypoints.xy:
-                for x, y in person_kps:
-                    x, y = int(x), int(y)
-                    if x > 0 and y > 0:
-                        cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, START_FRAME)
 
-    output_path = "output.jpg"
-    cv2.imwrite(output_path, img)
-    print(f"Result saved to {output_path}")
+    for frame_idx in range(START_FRAME, end):
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    max_display_width = 1280
-    h, w = img.shape[:2]
-    if w > max_display_width:
-        scale = max_display_width / w
-        display_img = cv2.resize(img, (max_display_width, int(h * scale)))
-    else:
-        display_img = img
+        results = model(frame, verbose=False)
+        annotated = results[0].plot()
+        out.write(annotated)
+        print(f"Frame {frame_idx}/{end - 1}", end="\r")
 
-    cv2.imshow("Pose Detection", display_img)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    cap.release()
+    out.release()
+    print("\nSaved output_with_detections.mp4")
 
 if __name__ == "__main__":
     main()
