@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
 START_FRAME = 0
-END_FRAME = 2000
+END_FRAME = 1000
 
 def main():
     model = YOLO("yolov8n-pose.pt")
@@ -48,9 +48,13 @@ def main():
             results = model(frame, verbose=False)
             out.write(results[0].plot())
 
+            all_boxes = [box.xyxy[0].tolist() for box in results[0].boxes]
+
+            if not is_valid_frame(all_boxes, width, height):
+                continue
+
             people = []
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
+            for x1, y1, x2, y2 in all_boxes:
                 area = (x2 - x1) * (y2 - y1)
                 people.append((area, (x1 + x2) / 2, (y1 + y2) / 2))
 
@@ -75,6 +79,22 @@ def main():
     print("\nSaved output_with_detections.mp4 and player_positions.csv")
 
     create_heatmap(p1_positions, p2_positions, background_frame, width, height)
+
+
+def is_valid_frame(boxes, width, height):
+    if len(boxes) < 2:
+        return False
+    # Close-up: any detected person taller than 45% of the frame height
+    if any((y2 - y1) > 0.45 * height for x1, y1, x2, y2 in boxes):
+        return False
+    # End-on/vertical view: two main players not spread horizontally
+    areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes]
+    top2 = sorted(zip(areas, boxes), reverse=True)[:2]
+    cx1 = (top2[0][1][0] + top2[0][1][2]) / 2
+    cx2 = (top2[1][1][0] + top2[1][1][2]) / 2
+    if abs(cx1 - cx2) < 0.25 * width:
+        return False
+    return True
 
 
 def make_heat_layer(positions, width, height):
