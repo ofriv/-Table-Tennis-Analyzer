@@ -8,10 +8,58 @@ from ultralytics import YOLO
 
 BALL_MODEL_PATH = "runs/segment/runs/ball_detection/train/weights/best.pt"
 
-START_FRAME      = 1200
-END_FRAME        = 3000
-OCR_INTERVAL     = 50
-BALL_TRAIL_LEN   = 30  # how many past ball positions to draw
+START_FRAME          = 1200
+END_FRAME            = 3000
+OCR_INTERVAL         = 50
+BALL_TRAIL_LEN       = 30
+DIRECTION_WINDOW     = 7   # frames to smooth ball direction
+MIN_RALLY_SPEED      = 3.0  # pixels/frame — below this the ball is considered still
+BALL_MISSING_TIMEOUT = 60  # frames without ball detection before rally ends
+
+
+class RallyTracker:
+    def __init__(self):
+        self.active      = False
+        self.shots       = 0
+        self.missing     = 0
+        self.recent_x    = []
+        self.prev_dir    = 0  # -1 or 1
+        self.start_frame = None
+        self.rallies     = []  # (start_frame, end_frame, shot_count)
+
+    def update(self, ball_pos, frame_idx, speed):
+        if ball_pos is None:
+            self.missing += 1
+            if self.missing >= BALL_MISSING_TIMEOUT and self.active:
+                self._end(frame_idx)
+            return
+
+        self.missing = 0
+        bx, _ = ball_pos
+        self.recent_x.append(bx)
+        if len(self.recent_x) > DIRECTION_WINDOW:
+            self.recent_x.pop(0)
+
+        if len(self.recent_x) < DIRECTION_WINDOW or speed < MIN_RALLY_SPEED:
+            return
+
+        curr_dir = 1 if self.recent_x[-1] > self.recent_x[0] else -1
+        if self.prev_dir != 0 and curr_dir != self.prev_dir:
+            if not self.active:
+                self.active      = True
+                self.start_frame = frame_idx
+                self.shots       = 1
+            self.shots += 1
+        self.prev_dir = curr_dir
+
+    def _end(self, frame_idx):
+        if self.shots >= 2:
+            self.rallies.append((self.start_frame, frame_idx, self.shots))
+        self.active      = False
+        self.shots       = 0
+        self.recent_x    = []
+        self.prev_dir    = 0
+        self.start_frame = None
 
 
 def main():
@@ -39,8 +87,9 @@ def main():
     p1_positions = []
     p2_positions = []
     scores       = []
-    ball_trail   = []  # (frame_idx, x, y, speed_px_per_frame) — rolling window
-    ball_data    = []  # full history for chart/csv
+    ball_trail   = []
+    ball_data    = []
+    rally        = RallyTracker()
     background_frame  = None
     valid_frame_count = 0
 
@@ -69,9 +118,9 @@ def main():
 
             # --- ball detection ---
             ball_pos = detect_ball(frame, ball_model)
+            speed = 0.0
             if ball_pos is not None:
                 bx, by = ball_pos
-                speed = 0.0
                 if ball_trail:
                     prev_frame, px, py, _ = ball_trail[-1]
                     frame_diff = max(frame_idx - prev_frame, 1)
@@ -83,8 +132,11 @@ def main():
                     ball_trail.pop(0)
                 bwriter.writerow([frame_idx + 1, f"{bx:.1f}", f"{by:.1f}", f"{speed:.2f}"])
 
+            rally.update(ball_pos, frame_idx, speed)
+
             annotated = results[0].plot()
             annotated = draw_ball_trail(annotated, ball_trail, fps)
+            annotated = draw_rally_overlay(annotated, rally)
             out.write(annotated)
 
             # --- player tracking ---
@@ -122,6 +174,7 @@ def main():
     create_heatmap(p1_positions, p2_positions, background_frame, width, height)
     create_score_chart(scores)
     create_ball_speed_chart(ball_data, fps)
+    create_rally_chart(rally.rallies)
 
 
 def detect_ball(frame, model):
@@ -155,6 +208,45 @@ def draw_ball_trail(frame, trail, fps):
     cv2.putText(frame, f"Ball: {last_spd_pxs:.0f} px/s",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     return frame
+
+
+def draw_rally_overlay(frame, rally):
+    if rally.active:
+        cv2.putText(frame, f"RALLY: {rally.shots} shots",
+                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    return frame
+
+
+def create_rally_chart(rallies):
+    if not rallies:
+        print("No rallies detected")
+        return
+
+    shot_counts   = [r[2] for r in rallies]
+    start_frames  = [r[0] for r in rallies]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    max_shots = max(shot_counts)
+    ax1.hist(shot_counts, bins=range(2, max_shots + 2), color="steelblue",
+             edgecolor="white", align="left")
+    ax1.set_xlabel("Shots per Rally")
+    ax1.set_ylabel("Number of Rallies")
+    ax1.set_title("Rally Length Distribution")
+    ax1.set_xticks(range(2, max_shots + 1))
+
+    ax2.scatter(start_frames, shot_counts, color="steelblue", s=30, alpha=0.7)
+    ax2.set_xlabel("Frame")
+    ax2.set_ylabel("Shots in Rally")
+    ax2.set_title("Rally Timeline")
+
+    avg = sum(shot_counts) / len(shot_counts)
+    fig.suptitle(f"Rally Analysis — {len(rallies)} rallies detected, avg {avg:.1f} shots")
+
+    plt.tight_layout()
+    plt.savefig("rally_chart.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved rally_chart.png ({len(rallies)} rallies, avg {avg:.1f} shots)")
 
 
 def is_valid_frame(boxes, width, height):
