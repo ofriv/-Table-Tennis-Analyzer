@@ -8,24 +8,27 @@ from ultralytics import YOLO
 
 BALL_MODEL_PATH = "runs/segment/runs/ball_detection/train/weights/best.pt"
 
-START_FRAME          = 1200
-END_FRAME            = 3000
+START_FRAME          = 1
+END_FRAME            = 45000
 OCR_INTERVAL         = 50
 BALL_TRAIL_LEN       = 30
-DIRECTION_WINDOW     = 7   # frames to smooth ball direction
+DIRECTION_WINDOW     = 7    # frames to smooth ball direction
+MIN_SHOT_TRAVEL      = 80   # min |x - last_shot_x| (px) before another shot can be counted
 MIN_RALLY_SPEED      = 3.0  # pixels/frame — below this the ball is considered still
-BALL_MISSING_TIMEOUT = 60  # frames without ball detection before rally ends
+BALL_MISSING_TIMEOUT = 60   # frames without ball detection before rally ends
+TABLE_LENGTH_M       = 2.74  # ITTF standard, used to calibrate px → meters
 
 
 class RallyTracker:
     def __init__(self):
-        self.active      = False
-        self.shots       = 0
-        self.missing     = 0
-        self.recent_x    = []
-        self.prev_dir    = 0  # -1 or 1
-        self.start_frame = None
-        self.rallies     = []  # (start_frame, end_frame, shot_count)
+        self.active       = False
+        self.shots        = 0
+        self.missing      = 0
+        self.recent_x     = []
+        self.prev_dir     = 0  # -1 or 1
+        self.last_shot_x  = None
+        self.start_frame  = None
+        self.rallies      = []  # (start_frame, end_frame, shot_count)
 
     def update(self, ball_pos, frame_idx, speed):
         if ball_pos is None:
@@ -44,12 +47,17 @@ class RallyTracker:
             return
 
         curr_dir = 1 if self.recent_x[-1] > self.recent_x[0] else -1
+
         if self.prev_dir != 0 and curr_dir != self.prev_dir:
-            if not self.active:
-                self.active      = True
-                self.start_frame = frame_idx
-                self.shots       = 1
-            self.shots += 1
+            # only count a shot if ball travelled enough since last counted shot
+            if self.last_shot_x is None or abs(bx - self.last_shot_x) > MIN_SHOT_TRAVEL:
+                if not self.active:
+                    self.active      = True
+                    self.start_frame = frame_idx
+                    self.shots       = 1
+                else:
+                    self.shots += 1
+                self.last_shot_x = bx
         self.prev_dir = curr_dir
 
     def _end(self, frame_idx):
@@ -59,13 +67,48 @@ class RallyTracker:
         self.shots       = 0
         self.recent_x    = []
         self.prev_dir    = 0
+        self.last_shot_x = None
         self.start_frame = None
+
+
+def calibrate_table(video_path, ball_model, start_frame, scan_frames=5):
+    print("Calibrating table scale...", flush=True)
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    table_widths = []
+    for _ in range(scan_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        results = ball_model(frame, verbose=False)
+        for box in results[0].boxes:
+            if int(box.cls[0]) == 0:
+                x1, _, x2, _ = box.xyxy[0].tolist()
+                w = x2 - x1
+                if w > 100:
+                    table_widths.append(w)
+        if table_widths:
+            break
+    cap.release()
+    if table_widths:
+        px_m = max(table_widths) / TABLE_LENGTH_M
+        print(f"Calibrated from table detection: {px_m:.1f} px/m")
+        return px_m
+    # fallback: assume table spans ~60% of frame width
+    cap2 = cv2.VideoCapture(video_path)
+    w = cap2.get(cv2.CAP_PROP_FRAME_WIDTH)
+    cap2.release()
+    px_m = (w * 0.60) / TABLE_LENGTH_M
+    print(f"Table not detected — using default calibration: {px_m:.1f} px/m")
+    return px_m
 
 
 def main():
     model      = YOLO("yolov8n-pose.pt")
-    ocr_reader = easyocr.Reader(['en'], gpu=False)
+    ocr_reader = easyocr.Reader(['en'], gpu=True)
     ball_model = YOLO(BALL_MODEL_PATH)
+
+    px_per_meter = calibrate_table(sys.argv[1], ball_model, START_FRAME)
 
     cap          = cv2.VideoCapture(sys.argv[1])
     width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -89,6 +132,7 @@ def main():
     scores       = []
     ball_trail   = []
     ball_data    = []
+    valid_frames = []  # original frame_idx written to output_with_detections.mp4
     rally        = RallyTracker()
     background_frame  = None
     valid_frame_count = 0
@@ -117,7 +161,7 @@ def main():
                 continue
 
             # --- ball detection ---
-            ball_pos = detect_ball(frame, ball_model)
+            ball_pos, _ = detect_ball_and_table(frame, ball_model)
             speed = 0.0
             if ball_pos is not None:
                 bx, by = ball_pos
@@ -135,9 +179,10 @@ def main():
             rally.update(ball_pos, frame_idx, speed)
 
             annotated = results[0].plot()
-            annotated = draw_ball_trail(annotated, ball_trail, fps)
+            annotated = draw_ball_trail(annotated, ball_trail, fps, px_per_meter)
             annotated = draw_rally_overlay(annotated, rally)
             out.write(annotated)
+            valid_frames.append(frame_idx)
 
             # --- player tracking ---
             people = []
@@ -173,22 +218,68 @@ def main():
 
     create_heatmap(p1_positions, p2_positions, background_frame, width, height)
     create_score_chart(scores)
-    create_ball_speed_chart(ball_data, fps)
+    create_ball_speed_chart(ball_data, fps, px_per_meter)
     create_rally_chart(rally.rallies)
+    export_longest_rally(rally.rallies, valid_frames, fps, width, height)
 
 
-def detect_ball(frame, model):
+def export_longest_rally(rallies, valid_frames, fps, width, height):
+    if not rallies:
+        print("No rallies to export")
+        return
+
+    start, end, shots = max(rallies, key=lambda r: r[2])
+
+    out_start = next((i for i, f in enumerate(valid_frames) if f >= start), None)
+    if out_start is None:
+        print("Could not locate rally in output video")
+        return
+    out_end = next((i for i in range(len(valid_frames) - 1, -1, -1) if valid_frames[i] <= end), out_start)
+
+    cap = cv2.VideoCapture("output_with_detections.mp4")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, out_start)
+
+    out = cv2.VideoWriter(
+        "longest_rally.mp4",
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height)
+    )
+
+    for _ in range(out_end - out_start + 1):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out.write(frame)
+
+    cap.release()
+    out.release()
+    duration = (end - start) / fps
+    print(f"Saved longest_rally.mp4 — original frames {start}-{end} ({shots} shots, {duration:.1f}s)")
+
+
+def detect_ball_and_table(frame, model):
     results = model(frame, verbose=False)
     # class 1 = ball, class 0 = table
-    ball_boxes = [box for box in results[0].boxes if int(box.cls[0]) == 1]
-    if not ball_boxes:
-        return None
-    best = max(ball_boxes, key=lambda b: float(b.conf[0]))
-    x1, y1, x2, y2 = best.xyxy[0].tolist()
-    return (x1 + x2) / 2, (y1 + y2) / 2
+    ball_pos = None
+    table_w  = None
+
+    ball_boxes = [b for b in results[0].boxes if int(b.cls[0]) == 1]
+    if ball_boxes:
+        best = max(ball_boxes, key=lambda b: float(b.conf[0]))
+        x1, y1, x2, y2 = best.xyxy[0].tolist()
+        ball_pos = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    table_boxes = [b for b in results[0].boxes if int(b.cls[0]) == 0]
+    if table_boxes:
+        best = max(table_boxes, key=lambda b: float(b.conf[0]))
+        x1, _, x2, _ = best.xyxy[0].tolist()
+        table_w = x2 - x1
+
+    return ball_pos, table_w
 
 
-def draw_ball_trail(frame, trail, fps):
+def draw_ball_trail(frame, trail, fps, px_per_meter):
     if not trail:
         return frame
 
@@ -203,10 +294,14 @@ def draw_ball_trail(frame, trail, fps):
         g = int(255 * (1 - spd_norm))
         cv2.circle(frame, (int(x), int(y)), max(3, int(8 * alpha)), (0, g, r), -1)
 
-    # current speed label
     last_spd_pxs = trail[-1][3] * fps  # pixels/second
-    cv2.putText(frame, f"Ball: {last_spd_pxs:.0f} px/s",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    if px_per_meter:
+        kmh = last_spd_pxs / px_per_meter * 3.6
+        label = f"Ball: {kmh:.1f} km/h"
+    else:
+        label = f"Ball: {last_spd_pxs:.0f} px/s"
+    cv2.putText(frame, label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     return frame
 
 
@@ -222,31 +317,33 @@ def create_rally_chart(rallies):
         print("No rallies detected")
         return
 
-    shot_counts   = [r[2] for r in rallies]
-    start_frames  = [r[0] for r in rallies]
+    shot_counts = [r[2] for r in rallies]
+    max_shots   = max(shot_counts)
+    avg         = sum(shot_counts) / len(shot_counts)
+    median      = sorted(shot_counts)[len(shot_counts) // 2]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(11, 6))
+    counts, _, _ = ax.hist(shot_counts, bins=range(2, max_shots + 2),
+                           color="steelblue", edgecolor="white", align="left")
 
-    max_shots = max(shot_counts)
-    ax1.hist(shot_counts, bins=range(2, max_shots + 2), color="steelblue",
-             edgecolor="white", align="left")
-    ax1.set_xlabel("Shots per Rally")
-    ax1.set_ylabel("Number of Rallies")
-    ax1.set_title("Rally Length Distribution")
-    ax1.set_xticks(range(2, max_shots + 1))
+    ax.axvline(avg, color="darkorange", linestyle="--", linewidth=2,
+               label=f"Mean: {avg:.1f}")
+    ax.axvline(median, color="seagreen", linestyle=":", linewidth=2,
+               label=f"Median: {median}")
+    ax.axvline(max_shots, color="crimson", linestyle="-", linewidth=2,
+               label=f"Longest: {max_shots}")
 
-    ax2.scatter(start_frames, shot_counts, color="steelblue", s=30, alpha=0.7)
-    ax2.set_xlabel("Frame")
-    ax2.set_ylabel("Shots in Rally")
-    ax2.set_title("Rally Timeline")
-
-    avg = sum(shot_counts) / len(shot_counts)
-    fig.suptitle(f"Rally Analysis — {len(rallies)} rallies detected, avg {avg:.1f} shots")
+    ax.set_xlabel("Shots per Rally")
+    ax.set_ylabel("Number of Rallies")
+    ax.set_title(f"Rally Length Distribution — {len(rallies)} rallies")
+    ax.set_xticks(range(2, max_shots + 1))
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
     plt.savefig("rally_chart.png", dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved rally_chart.png ({len(rallies)} rallies, avg {avg:.1f} shots)")
+    print(f"Saved rally_chart.png ({len(rallies)} rallies, avg {avg:.1f}, longest {max_shots})")
 
 
 def is_valid_frame(boxes, width, height):
@@ -309,19 +406,24 @@ def create_score_chart(scores):
     print("Saved score_chart.png")
 
 
-def create_ball_speed_chart(ball_data, fps):
+def create_ball_speed_chart(ball_data, fps, px_per_meter):
     if len(ball_data) < 2:
         print("Not enough ball detections for speed chart")
         return
 
-    frames = [d[0] for d in ball_data]
-    speeds = [d[3] * fps for d in ball_data]  # pixels/second
+    minutes = [d[0] / fps / 60 for d in ball_data]
+    if px_per_meter:
+        speeds = [d[3] * fps / px_per_meter * 3.6 for d in ball_data]  # km/h
+        ylabel = "Ball Speed (km/h)"
+    else:
+        speeds = [d[3] * fps for d in ball_data]  # px/s fallback
+        ylabel = "Ball Speed (px/s)"
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(frames, speeds, color="orange", linewidth=0.8, alpha=0.8)
-    ax.fill_between(frames, speeds, alpha=0.2, color="orange")
-    ax.set_xlabel("Frame")
-    ax.set_ylabel("Ball Speed (pixels / second)")
+    ax.plot(minutes, speeds, color="orange", linewidth=0.8, alpha=0.8)
+    ax.fill_between(minutes, speeds, alpha=0.2, color="orange")
+    ax.set_xlabel("Time (minutes)")
+    ax.set_ylabel(ylabel)
     ax.set_title("Table Tennis Ball Speed Over Time")
 
     plt.tight_layout()
